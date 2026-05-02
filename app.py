@@ -37,6 +37,33 @@ BAUD_RATE    = 115200
 PASSWORD_FILE = "locker_system.pwd"
 
 # ─────────────────────────────────────────
+# UID Validation
+# ─────────────────────────────────────────
+def is_valid_uid_format(uid):
+    """
+    Validate UID format: xx:xx:xx:xx (hex bytes separated by colons)
+    Examples: "1A:2B:3C:4D", "00:11:22:33"
+    """
+    if not uid or not isinstance(uid, str):
+        return False
+    
+    parts = uid.split(":")
+    # Must have at least 4 parts
+    if len(parts) < 4:
+        return False
+    
+    # Each part must be exactly 2 hex characters
+    for part in parts:
+        if len(part) != 2:
+            return False
+        try:
+            int(part, 16)  # Try to parse as hex
+        except ValueError:
+            return False
+    
+    return True
+
+# ─────────────────────────────────────────
 # Password Manager
 # ─────────────────────────────────────────
 class PasswordManager:
@@ -1136,6 +1163,90 @@ class UIDDialog(QDialog):
         event.accept()
 
 # ─────────────────────────────────────────
+# Admin Scanner Window
+# ─────────────────────────────────────────
+class AdminScannerWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Admin Scanner")
+        self.setMinimumWidth(350)
+        self.setWindowFlags(Qt.Window | Qt.WindowCloseButtonHint)
+        self.parent_win = parent
+        self.last_uid = None
+
+        self.setStyleSheet("""
+            QDialog     { background: #1e1e2e; color: #cdd6f4; }
+            QLabel      { color: #cdd6f4; font-size: 13px; }
+            QPushButton {
+                background: #313244; color: #cdd6f4;
+                border: none; border-radius: 6px;
+                padding: 8px 14px; font-size: 12px;
+            }
+            QPushButton:hover   { background: #45475a; }
+            QPushButton#success { background: #a6e3a1; color: #1e1e2e; }
+            QPushButton#success:hover { background: #94d49b; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        title = QLabel("Admin Scanner")
+        title.setFont(QFont("Arial", 14, QFont.Bold))
+        layout.addWidget(title)
+
+        layout.addSpacing(20)
+
+        # UID Display
+        self.uid_label = QLabel("Waiting for scan...")
+        self.uid_label.setAlignment(Qt.AlignCenter)
+        self.uid_label.setStyleSheet(
+            "color: #a6e3a1; font-size: 18px; font-weight: bold; "
+            "font-family: monospace; background: #313244; "
+            "border-radius: 6px; padding: 20px;"
+        )
+        layout.addWidget(self.uid_label)
+
+        layout.addSpacing(20)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        self.scan_again_btn = QPushButton("Scan Again")
+        self.scan_again_btn.setObjectName("success")
+        self.scan_again_btn.clicked.connect(self.clear_scan)
+        self.scan_again_btn.setEnabled(False)  # Disabled until first scan
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+
+        btn_row.addStretch()
+        btn_row.addWidget(self.scan_again_btn)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        # Register this as scan target
+        if self.parent_win:
+            self.parent_win.scan_target_dialog = self
+
+    def receive_uid(self, uid):
+        """Receive scanned UID from admin scanner"""
+        self.last_uid = uid
+        self.uid_label.setText(uid)
+        self.scan_again_btn.setEnabled(True)  # Enable "Scan Again" after scan
+
+    def clear_scan(self):
+        """Clear the display and wait for next scan"""
+        self.uid_label.setText("Waiting for scan...")
+        self.last_uid = None
+        self.scan_again_btn.setEnabled(False)  # Disable until next scan
+
+    def closeEvent(self, event):
+        """Clean up when window closes"""
+        if self.parent_win:
+            self.parent_win.scan_target_dialog = None
+        event.accept()
+
+# ─────────────────────────────────────────
 # Clear Logs Dialog
 # ─────────────────────────────────────────
 class ClearLogsDialog(QDialog):
@@ -1504,12 +1615,19 @@ class MainWindow(QMainWindow):
         self.scan_target_dialog = None
         self._active_dialog     = None
         self._log_window        = None
+        self._scanner_window    = None
         self.locker_buttons     = {}
         self.locker_status_labels = {}
+        self.locker_connection_status = {}  # Track connection status for each locker (True=ok, False=disconnected, None=checking)
+        self.admin_scanner_connection_status = None  # Track admin scanner status (True=ok, False=disconnected, None=checking)
         
         # Password session tracking (3 minutes)
         self.last_password_verify_time = None
         self.password_session_duration = 180  # 3 minutes in seconds
+        
+        # Initialize locker connection status to None (checking)
+        for i in range(1, LOCKER_COUNT + 1):
+            self.locker_connection_status[i] = None
         
         # Check and set password on first launch
         if not self.password_mgr.password_exists():
@@ -1636,11 +1754,16 @@ class MainWindow(QMainWindow):
         adm_btn = QPushButton("Admin Cards")
         adm_btn.clicked.connect(self._open_global)
 
+        self.scanner_btn = QPushButton("Admin Scanner")
+        self.scanner_btn.clicked.connect(self._open_admin_scanner)
+        self._update_scanner_btn_status()
+
         log_btn = QPushButton("View Logs")
         log_btn.setObjectName("accent")
         log_btn.clicked.connect(self._open_logs)
 
         bot.addWidget(adm_btn)
+        bot.addWidget(self.scanner_btn)
         bot.addStretch()
         bot.addWidget(log_btn)
         ml.addLayout(bot)
@@ -1700,7 +1823,7 @@ class MainWindow(QMainWindow):
             return
 
         parts = line.split(":")
-        # minimum: KEY + index + at least one UID byte = 3 parts
+        # minimum: KEY + index + status/uid = 3 parts
         if len(parts) < 3:
             return
 
@@ -1709,8 +1832,21 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
 
-        uid = ":".join(parts[2:])
-        if not uid:
+        message_content = ":".join(parts[2:])
+        if not message_content:
+            return
+
+        # Check if this is a connection status message (ok/disconnected)
+        if message_content in ["ok", "disconnected"]:
+            self._handle_locker_status(idx, message_content)
+            return
+
+        # Otherwise, treat it as a UID (card scan)
+        uid = message_content
+        
+        # Validate UID format before processing
+        if not is_valid_uid_format(uid):
+            print(f"Invalid UID format: {uid}. Expected format: xx:xx:xx:xx")
             return
 
         print(f"INDEX: {idx}  UID: {uid}")
@@ -1742,6 +1878,39 @@ class MainWindow(QMainWindow):
             f"{SECRET_KEY}:{idx}:{'true' if matched else 'false'}"
         )
 
+    def _handle_locker_status(self, locker_id, status_msg):
+        """
+        Handle locker/admin scanner connection status messages.
+        status_msg: "ok" or "disconnected"
+        locker_id: 0 for admin scanner, 1-7 for lockers
+        """
+        is_connected = (status_msg == "ok")
+        
+        # Admin scanner (index 0)
+        if locker_id == 0:
+            current_status = self.admin_scanner_connection_status
+            if current_status != is_connected:
+                self.admin_scanner_connection_status = is_connected
+                print(f"Admin scanner status changed: {'Connected' if is_connected else 'Disconnected'}")
+                self._update_scanner_btn_status()
+            else:
+                print(f"Admin scanner status unchanged (ignoring duplicate): {status_msg}")
+            return
+        
+        # Locker (1-7)
+        if locker_id < 1 or locker_id > LOCKER_COUNT:
+            return
+        
+        current_status = self.locker_connection_status.get(locker_id, None)
+        
+        # Only update if status has changed (ignore duplicates)
+        if current_status != is_connected:
+            self.locker_connection_status[locker_id] = is_connected
+            print(f"Locker {locker_id} status changed: {'Connected' if is_connected else 'Disconnected'}")
+            self.update_locker_status()
+        else:
+            print(f"Locker {locker_id} status unchanged (ignoring duplicate): {status_msg}")
+
     def _on_serial_error(self, msg):
         print(f"Serial error: {msg}")
         if self.serial_worker:
@@ -1750,6 +1919,12 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText("● Error — reconnect")
         self.status_lbl.setStyleSheet("color: #f38ba8; font-size: 12px;")
         self.connect_btn.setText("Connect")
+        # Set all lockers and admin scanner as disconnected on error
+        for i in range(1, LOCKER_COUNT + 1):
+            self.locker_connection_status[i] = False
+        self.admin_scanner_connection_status = False
+        self.update_locker_status()
+        self._update_scanner_btn_status()
 
     # ────────────────────────────────────
     def _refresh_ports(self):
@@ -1769,6 +1944,12 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText("● Disconnected")
             self.status_lbl.setStyleSheet("color: #f38ba8; font-size: 12px;")
             self.connect_btn.setText("Connect")
+            # Set all lockers and admin scanner as disconnected
+            for i in range(1, LOCKER_COUNT + 1):
+                self.locker_connection_status[i] = False
+            self.admin_scanner_connection_status = False
+            self.update_locker_status()
+            self._update_scanner_btn_status()
         else:
             port = self.port_combo.currentText()
             if not port:
@@ -1783,18 +1964,113 @@ class MainWindow(QMainWindow):
                     "color: #a6e3a1; font-size: 12px;"
                 )
                 self.connect_btn.setText("Disconnect")
+                # Reset all statuses to None (checking) when reconnecting
+                for i in range(1, LOCKER_COUNT + 1):
+                    self.locker_connection_status[i] = None
+                self.admin_scanner_connection_status = None
+                self.update_locker_status()
+                self._update_scanner_btn_status()
             except Exception as e:
                 QMessageBox.critical(
                     self, "Connection Error",
                     f"Could not open {port}:\n{e}"
                 )
 
+    def _update_scanner_btn_status(self):
+        """Update Admin Scanner button to show connection status"""
+        status = self.admin_scanner_connection_status
+        
+        # Checking status (None) - grey/blue
+        if status is None:
+            self.scanner_btn.setText("Admin Scanner")
+            self.scanner_btn.setEnabled(False)
+            self.scanner_btn.setStyleSheet("")  # Clear first
+            self.scanner_btn.setStyleSheet("""
+                QPushButton {
+                    background: #313244;
+                    color: #89b4fa;
+                    border: none;
+                    border-radius: 8px;
+                    padding: 16px;
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background: #45475a;
+                }
+            """)
+        # Connected (True) - green
+        elif status is True:
+            self.scanner_btn.setText("● Admin Scanner")
+            self.scanner_btn.setEnabled(True)
+            self.scanner_btn.setStyleSheet("")  # Clear first
+            self.scanner_btn.setStyleSheet("""
+                QPushButton {
+                    background: #313244;
+                    color: #a6e3a1;
+                    border: none;
+                    border-radius: 8px;
+                    padding: 16px;
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background: #45475a;
+                }
+            """)
+        # Disconnected (False) - red
+        else:
+            self.scanner_btn.setText("⊗ Admin Scanner")
+            self.scanner_btn.setEnabled(False)
+            self.scanner_btn.setStyleSheet("")  # Clear first
+            self.scanner_btn.setStyleSheet("""
+                QPushButton {
+                    background: #313244;
+                    color: #f38ba8;
+                    border: none;
+                    border-radius: 8px;
+                    padding: 16px;
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background: #45475a;
+                }
+            """)
+
+    def _open_admin_scanner(self):
+        """Open the admin scanner window"""
+        if not self.serial_worker or not self.serial_worker.running:
+            QMessageBox.warning(self, "Not Connected", "Please connect to a device first.")
+            return
+        
+        # Close previous scanner window if open
+        if hasattr(self, '_scanner_window') and self._scanner_window and not self._scanner_window.isHidden():
+            self._scanner_window.close()
+        
+        self._scanner_window = AdminScannerWindow(parent=self)
+        self._scanner_window.show()
+
     # ────────────────────────────────────
     def update_locker_status(self):
         for i in range(1, LOCKER_COUNT + 1):
-            uids = self.db.get_locker_uids(i)
-            status = "Occupied" if uids else "Available"
-            color = "#f38ba8" if uids else "#a6e3a1"  # red for occupied, green for available
+            # Check connection status first (takes priority)
+            is_connected = self.locker_connection_status.get(i, None)
+            
+            if is_connected is None:
+                # Status is unknown - show checking
+                status = "Checking..."
+                color = "#89b4fa"  # blue
+            elif not is_connected:
+                # Locker is disconnected - show yellow
+                status = "Disconnected"
+                color = "#f1e68c"  # yellow
+            else:
+                # Locker is connected - show occupied or available
+                uids = self.db.get_locker_uids(i)
+                status = "Occupied" if uids else "Available"
+                color = "#f38ba8" if uids else "#a6e3a1"  # red for occupied, green for available
+            
             self.locker_status_labels[i].setText(status)
             self.locker_status_labels[i].setStyleSheet(f"color: {color}; font-size: 12px; background: transparent;")
 
